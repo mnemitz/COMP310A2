@@ -20,7 +20,7 @@ typedef struct pair		/* This will represent a key-value pair  */
 	char value[VALUESIZE];
 }pair;
 
-typedef struct store		/* This will represent a table of key-value pairs  */
+typedef struct store		/* This will represent a 2x2 matrix of key-value pairs  */
 {
 	pair pairs[NUMBER_OF_PODS][ENTRIES_PER_POD];
 }store;
