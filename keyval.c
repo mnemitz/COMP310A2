@@ -12,20 +12,30 @@
 #define VALUESIZE 256
 #define DB_NAME_SIZE 20
 
+// TODO: MAKE WRITE COUNT SHARED SO DIFFERENT PROCESSES DON'T OVERWRITE THINGS
+
+
 /* 1ST:	STRUCTS */
 
-typedef struct pair		/* This will represent a key-value pair  */
+typedef struct pair    /* This will represent a key-value pair  */
 {
 	char key[KEYSIZE];
 	char value[VALUESIZE];
 }pair;
 
-typedef struct store		/* This will represent a 2x2 matrix of key-value pairs  */
+typedef struct pod
 {
-	pair pairs[NUMBER_OF_PODS][ENTRIES_PER_POD];
+	int writeIndx;
+	pair pairs[ENTRIES_PER_POD];
+}pod;
+
+typedef struct store    /* This will represent a 2d matrix of key-value pairs  */
+{
+	pod pods[NUMBER_OF_PODS];
+
 }store;
 
-typedef struct keyread_count	/* This will keep track of the index of the last read pair with key k  */
+typedef struct keyread_count    /* This is for the reader, will keep track of the index of the last read pair with key k  */
 {
 	char key[KEYSIZE];
 	int lastOffs;
@@ -40,7 +50,6 @@ ideally I would make it dynamically grow to support more keys, but I'm keeping i
 char dbname[DB_NAME_SIZE];
 int db_fd = 0;
 store *shared_store_addr;
-int pod_write_count[NUMBER_OF_PODS];
 keyread_count keycount[MAX_NUMBER_KEYS];
 
 /* TODO: semaphores */
@@ -59,55 +68,41 @@ int kv_store_create(char* name)
 	/* Compute total byte size of the key-value store,
 	   and define the shared memory size to be that  */
 	shared_store_addr = mmap(NULL, sizeof(store), PROT_READ | PROT_WRITE, MAP_SHARED, db_fd, 0);
+	ftruncate(db_fd, 0);
 	ftruncate(db_fd, sizeof(store));
 	close(db_fd);
 
 	/* Now instantiate an empty store struct and dump it in, then free it */
-	store *mystore = malloc(sizeof(store));
-	memcpy(shared_store_addr, mystore, sizeof(store));
-	free(mystore);
-
-	/* Lastly, initialize all the key counts to 0 */
-	int i;
-	for( i = 0; i < NUMBER_OF_PODS; i++ )
-	{
-		pod_write_count[i] = 0;
-	}
+	store *ogStore = malloc(sizeof(store));
+	memcpy(shared_store_addr, ogStore, sizeof(store));
+	free(ogStore);
 	return 0;
 }
 
 
 /* Next, a function to write two strings as a keyval pair,
 	mmap() lets us access the shared database from the context of THIS process's address space
-	we hash the supplied key so that we write to the correct pod of the shared database
-*/
+	we hash the supplied key so that we write to the correct pod of the shared database */
 int kv_store_write(char* key, char* value)
 {
 	/* First we hash the key to obtain the desired pod index */
 	int keyhash = hash_func(key);
 	printf("Hash of key:\t%d\n",keyhash);
 
-	char *keydest = (*shared_store_addr).pairs[keyhash][pod_write_count[keyhash]].key;
-	char *valdest = (*shared_store_addr).pairs[keyhash][pod_write_count[keyhash]].value;
+	pod* thisKeysPod = &(shared_store_addr -> pods[keyhash]);
+
+
+	char* keydest = thisKeysPod -> pairs[thisKeysPod->writeIndx].key;
+	char* valdest = thisKeysPod -> pairs[thisKeysPod->writeIndx].value;
 
 	strcpy(keydest, key);
 	strcpy(valdest, value);
 
-	/* Then we increment the counter for that index for the next time ...
-	....resetting it if it goes over the number of entries in that pod */
-	if (pod_write_count[keyhash] < ENTRIES_PER_POD)
-	{
-		pod_write_count[keyhash]++;
-	}
-	else
-	{
-		pod_write_count[keyhash] = 0;
-	}
 	return 0;
 }
 
 /* Hash function for the keys */
-int hash_func(char *word)
+int hash_func(char* word)
 {
 	int hashAddress = 5381;
 	int counter;
@@ -121,7 +116,7 @@ int hash_func(char *word)
 
 char* kv_store_read(char* key)
 {
-	char *retbuff = malloc(VALUESIZE*sizeof(char));	// returns pointer to char[VALUESIZE] on heap
+	char* retbuff = malloc(VALUESIZE*sizeof(char));	// returns pointer to char[VALUESIZE] on heap
 
 	/* First we want to find the key in the key count table to see where in the pod to go  */
 	int i = 0;
@@ -156,12 +151,13 @@ char* kv_store_read(char* key)
 	int zeroIfSame;
 	while(newOffs < ENTRIES_PER_POD)
 	{
+		pod* thisKeysPodAddr = &(shared_store_addr->pods[keyhash]);
 		// if the one we find is the right key
-		zeroIfSame = strcmp((*shared_store_addr).pairs[keyhash][newOffs].key, key);
+		zeroIfSame = strcmp(thisKeysPodAddr -> , key);
 		if(zeroIfSame == 0)
 		{
 			// fill the return buffer with found value
-			strcpy(retbuff, (*shared_store_addr).pairs[keyhash][newOffs].value);
+			strcpy(retbuff, shared_store_addr -> pods[keyhash][newOffs].value);
 			keycount[i].lastOffs = newOffs;
 			break;
 		}
