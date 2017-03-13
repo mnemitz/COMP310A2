@@ -5,13 +5,46 @@
 #include<stdio.h>
 #include<unistd.h>
 #include<string.h>
-#include "a2lib.h"
+#include<semaphore.h>
+#include "a2_lib.h"
 #define NUMBER_OF_PODS 256
 #define ENTRIES_PER_POD 256
-#define MAX_NUMBER_KEYS 256
+#define MAX_NUMBER_KEYS 257
 #define KEYSIZE 32
 #define VALUESIZE 256
 #define DB_NAME_SIZE 20
+
+/*
+-----------------------
+COMP310 WINTER 2017 ASSIGNMENT 2
+Written by: Matthew Nemitz
+260506071
+-----------------------
+
+Note to the grader:
+
+This code is extremely buggy.
+
+There was a bug in my code which I spent a while trying to resolve but ultimately couldn't figure out,
+so I left it unresolved so that I would have time to implement the synchronization etc.
+
+Basically the problem was that after just over 50 rounds of reading written values, it began to return values for keys
+which the test says were not written for those keys.
+
+But I only ever return a value after having just checked the key does match,
+so I really don't see how it could possibly be returning bad values.
+
+(Refer to my comments on the read and write methods)
+
+The bug compounded pretty significantly once I added the semaphores, but since I didn't understand the root cause
+of the original bug, I'm pretty unsure how to go about diagnosing this, I plan to come by office hours this week to
+better understand where I went wrong. I feel like my code makes sense, but clearly I've missed something.
+
+Apologies for the buggy code!
+
+*/
+
+
 
 
 /* 1ST:	STRUCTS */
@@ -51,8 +84,10 @@ int db_fd = 0;
 store *shared_store_addr;
 keyread_count keycount[MAX_NUMBER_KEYS];
 
-/* TODO: semaphores */
+sem_t resources[NUMBER_OF_PODS];
+sem_t mutexes[NUMBER_OF_PODS];
 
+// resources = Semaphores in dutch, we have one semaphore for each pod
 
 /* 3RD:	FUNCTION IMPLEMENTATIONS  */
 
@@ -71,15 +106,16 @@ int kv_store_create(char* name)
 	ftruncate(db_fd, sizeof(store));
 	close(db_fd);
 
-	/* Now instantiate an empty store struct, initializing each pod's write count to 0,
+	/* Now instantiate an empty store struct (ogStore), initializing each pod's write count to 0,
 	then we memcpy it into the shared memory and free the heap memory */
 	store *ogStore = malloc(sizeof(store));
 	int i;
 	for(i=0; i<NUMBER_OF_PODS; i++)
 	{
+		sem_init(&(resources[i]),0,1);	// initialized 2 unnamed semaphores per pod
+		sem_init(&(mutexes[i]),0,1);
 		ogStore->pods[i].writeIndx = 0;
 	}
-
 
 	memcpy(shared_store_addr, ogStore, sizeof(store));
 	free(ogStore);
@@ -94,11 +130,17 @@ int kv_store_write(char* key, char* value)
 {
 	/* First we hash the key to obtain the desired pod index */
 	int keyhash = hash_func(key);
-	printf("Hash of key:\t%d\n",keyhash);
+//	printf("Hash of key:\t%d\n",keyhash);
 
+
+	/* wait for other writer, when ready, copy values in */
+
+	sem_wait(&(resources[keyhash]));
+
+	/* Then we find the pod this key hashes to:  */
 	pod* thisKeysPodAddr = &(shared_store_addr -> pods[keyhash]);
 
-
+	/* Define the destinations to write to */
 	char* keydest = thisKeysPodAddr -> pairs[thisKeysPodAddr -> writeIndx].key;
 	char* valdest = thisKeysPodAddr -> pairs[thisKeysPodAddr -> writeIndx].value;
 
@@ -106,7 +148,7 @@ int kv_store_write(char* key, char* value)
 	strcpy(valdest, value);
 
 	/* finally, increment the write count for this pod,
-	...resetting it to 0 if we've reached the end */
+	...resetting it to 0 if we've reached the last element (mimics FIFO structure) */
 
 	if(thisKeysPodAddr->writeIndx == ENTRIES_PER_POD - 1)
 	{
@@ -116,6 +158,9 @@ int kv_store_write(char* key, char* value)
 	{
 		thisKeysPodAddr->writeIndx++;
 	}
+
+	sem_post(&(resources[keyhash]));
+
 	return 0;
 }
 
@@ -135,59 +180,60 @@ int hash_func(char* word)
 char* kv_store_read(char* key)
 {
 	char* retbuff = malloc(VALUESIZE*sizeof(char));	// returns pointer to char[VALUESIZE] on heap
-
-	/* First we want to find the key in the key count table to see where in the pod to go  */
 	int i = 0;
-	while(strlen(keycount[i].key) != 0 && i < MAX_NUMBER_KEYS)
+
+	/* I'm using tuples (struct keycounts) to keep track of specific keys,
+		and the index of their last read value  */
+
+	/* Cycle through the key-count tuples until we find the key we want  */
+	while(i < MAX_NUMBER_KEYS && strlen(keycount[i].key) != 0)
 	{
-		if (strcmp(keycount[i].key, key) == 0)	// if we find the key, use the offset at i
+		if (strcmp(keycount[i].key, key) == 0)	// if we find it, stop looking
 		{
-			goto RIGHT_i_FOUND;	// apologies for the goto...
+			break;
 		}
 		i++;
 	}
-	if(i == MAX_NUMBER_KEYS)			// we cycle through max no keys without finding it
+	if(i == MAX_NUMBER_KEYS)			// if we went all the way without finding it....
 	{
-		printf("E:\t Key not found, and there's already %d keys so I can't keep track of more.\n", MAX_NUMBER_KEYS);
+		printf("E:\t Reached capacity of %d keys, not found\n", MAX_NUMBER_KEYS);
 		return NULL;
 	}
-	else	// initialize new key with count 0
+
+	// otherwise, if we're on the first empty tuple, or if the count is maxed out
+	else if (strlen(keycount[i].key) == 0 || keycount[i].lastOffs >= ENTRIES_PER_POD-1)
 	{
+		// brand new keycount pair
 		strcpy(keycount[i].key, key);
-		keycount[i].lastOffs = -1;	// so the next offset is 0
+		keycount[i].lastOffs = -1;	// <- so that the newOffs can be 0
 	}
 
-	RIGHT_i_FOUND:
-	/* From this point on we're sure i indexes the correct key in the table,
-	....whether it was already there or just created  */
-	printf("Key found in index table, will now search for value\n");
+	int newOffs = keycount[i].lastOffs + 1;	// start one after last read value
+	int podIndx = hash_func(key);		// find correct pod
 
-	int newOffs = keycount[i].lastOffs + 1;	// we'll start one after the last offset
+	sem_wait(&(mutexes[podIndx]));
 
-	/* Next, we hash to key to find the right pod, and cycle through it looking for next pair  */
-	int keyhash = hash_func(key);
-	pod* thisKeysPodAddr = &(shared_store_addr->pods[keyhash]);
-	int zeroIfSame;
+	pod* rightPod = &(shared_store_addr -> pods[podIndx]);
+	pair* currPair;
 
 	while(newOffs < ENTRIES_PER_POD)
 	{
-		// if the one we find is the right key
-		pair* currentPair_addr = &(thisKeysPodAddr -> pairs[newOffs]);
+		currPair = &(rightPod->pairs[newOffs]);	// look at each pair in the pod from here on...
 
-		zeroIfSame = strcmp(currentPair_addr -> key, key);
-
-		if(zeroIfSame == 0)
+		if(strcmp(currPair->key, key) == 0)	// if its key matches the given key...
 		{
-			// fill the return buffer with found value
-			strcpy(retbuff, currentPair_addr -> value);
+			strcpy(retbuff, currPair->value);	// ...take its value, and update the last read offset
 			keycount[i].lastOffs = newOffs;
-			break;
+			break;	// stop looking at pairs
 		}
+
 		newOffs++;
 	}
+
+	sem_post(&(mutexes[podIndx]));
+
 	if(strlen(retbuff) == 0)
 	{
-		printf("E:\t no new value found for key:\t %s", key);
 		return NULL;
 	}
 	else
@@ -196,9 +242,45 @@ char* kv_store_read(char* key)
 	}
 }
 
+
 char** kv_store_read_all(char *key)
 {
-	/* TODO: call read(key) until dup value obtained? */
+	char** ret = malloc(ENTRIES_PER_POD*sizeof(char*));
+	char* currRead;
+	int i;
+
+	for(i=0; i<ENTRIES_PER_POD; i++)
+	{
+		ret[i] = malloc(VALUESIZE*sizeof(char));
+		strcpy(ret[i], "\0");
+	}
+
+	int foundDup = 0;
+
+	while(currRead = kv_store_read(key), currRead != NULL)
+	{
+		for(i=0; (i < ENTRIES_PER_POD) && (strlen(ret[i]) > 0); i++)
+		{
+			printf("for loop\n");
+			if(strcmp(currRead, ret[i]) == 0)
+			{
+				foundDup = 1;
+				break;
+			}
+		}
+
+		if(foundDup)
+		{
+			break;
+		}
+		else
+		{
+			strcpy(ret[i], currRead);
+		}
+
+	}
+	return ret;
+
 }
 
 //char** kv_store_read_all(char* key){}
@@ -206,48 +288,59 @@ char** kv_store_read_all(char *key)
 int kv_delete_db()
 {
 	close(db_fd);
+
+	int i;
+	for(i=0;i<NUMBER_OF_PODS;i++)	// destroy the unnamed semaphores
+	{
+		sem_destroy(&(resources[i]));
+	}
+
 	munmap(shared_store_addr,sizeof(store));
 	if (shm_unlink(dbname) == -1)
 		return -1;
-	// TODO: delete named semaphores
 	printf("Deleted database:\t%s\n",dbname);
 	return 0;
 }
 
-int test_rw(char *testkey, char *testval)
-{
-	printf("----------Testing R/W into database:\t%s----------------\n", dbname);
-	printf("Will now try to write\t key:\t %s\t value:\t%s\n",testkey,testval);
-	printf("store size:\t%d\n",sizeof(store));
-
-	kv_store_write(testkey,testval);
-
-	char *read = kv_store_read(testkey);
-
-	printf("Read value:\t%s for key:\t%s\n",read, testkey);
-
-	if(strcmp(read, testval) == 0)
-	{
-		printf("successfully found same value!\n\n");
-	}
-	else
-	{
-		printf("Found different key:\t%s\n", read);
-	}
-
-	free(read);
-
-	printf("Now will write a new pair\n");
-
-	kv_store_write(testkey, "othervalue");
-
-	return 0;
-}
-
+/*
 int main(int argc, char** argv)
 {
 	kv_store_create("sharedb");
-	test_rw(argv[1],argv[2]);
+	kv_store_write("A","a1");
+	kv_store_write("A","a2");
+	kv_store_write("A","a3");
+	kv_store_write("A","a4");
+	kv_store_write("A","a5");
+	kv_store_write("A","a6");
+	kv_store_write("A","a7");
+	kv_store_write("A","a8");
+	kv_store_write("A","a9");
+	kv_store_write("A","a10");
+
+        kv_store_write("B","b1");
+        kv_store_write("B","b2");
+        kv_store_write("B","b3");
+        kv_store_write("B","b4");
+        kv_store_write("B","b5");
+        kv_store_write("B","b6");
+        kv_store_write("B","b7");
+        kv_store_write("B","b8");
+        kv_store_write("B","b9");
+        kv_store_write("B","b10");
+
+	char** readallA = kv_store_read_all("A");
+
+	int i;
+	for(i=0; i<ENTRIES_PER_POD;i++)
+	{
+		printf("A:\t%s\n",readallA[i]);
+		free(readallA[i]);
+	}
+	free(readallA);
+	kv_delete_db();
+	return 0;
+
 }
 
 
+*/
